@@ -1,0 +1,421 @@
+-- Dynamic Raid Group First + Player First (Cell add-on, WotLK 3.3.5a)
+-------------------------------------------------------
+-- OPTIONS
+-------------------------------------------------------
+
+local PLAYER_FIRST = true
+local MY_GROUP_FIRST = true
+local REQUIRE_COMBINE_GROUPS_OFF = true
+local QUEUE_TIMER = 0.5
+
+-------------------------------------------------------
+-- 3.3.5a COMPATIBILITY SHIMS
+-------------------------------------------------------
+
+-- Minimal C_Timer.After / C_Timer.NewTimer (not present pre-WoD)
+if not C_Timer then
+    C_Timer = {}
+    local pending = {}
+    
+    local driver = CreateFrame("Frame")
+    driver:SetScript("OnUpdate", function(self, elapsed)
+            for handle, timer in pairs(pending) do
+                timer.remaining = timer.remaining - elapsed
+                if timer.remaining <= 0 then
+                    pending[handle] = nil
+                    timer.callback()
+                end
+            end
+    end)
+    
+    function C_Timer.After(seconds, callback)
+        local handle = {}
+        pending[handle] = { remaining = seconds, callback = callback }
+    end
+    
+    function C_Timer.NewTimer(seconds, callback)
+        local handle = {}
+        pending[handle] = { remaining = seconds, callback = callback }
+        return {
+            Cancel = function() pending[handle] = nil end,
+        }
+    end
+end
+
+-- IsInRaid() doesn't exist pre-5.0.4; 3.3.5a equivalent is GetNumRaidMembers() > 0
+local function IsInRaid()
+    return GetNumRaidMembers() > 0
+end
+
+-------------------------------------------------------
+-- VARIABLES
+-------------------------------------------------------
+
+local F = Cell.funcs
+local playerName = GetUnitName("player")
+local updateQueued = false
+local queuedTimer = nil
+
+-------------------------------------------------------
+-- FIND PLAYER'S RAID GROUP
+-------------------------------------------------------
+
+local function GetMyRaidGroup()
+    if not IsInRaid() then return nil end
+    
+    -- Cell helper, if it exists on this port
+    if F.GetRaidInfoByName then
+        local _, subgroup = F.GetRaidInfoByName(playerName)
+        if subgroup then return subgroup end
+    end
+    
+    -- Blizzard fallback (GetNumRaidMembers, not GetNumGroupMembers, on 3.3.5a)
+    for i = 1, GetNumRaidMembers() do
+        local name, _, subgroup = GetRaidRosterInfo(i)
+        if name and name:match("^[^-]+") == playerName then
+            return subgroup
+        end
+    end
+    
+    return nil
+end
+
+-------------------------------------------------------
+-- GET VISIBLE RAID GROUPS
+-------------------------------------------------------
+
+local function GetShownGroups()
+    local layout = Cell.vars.currentLayoutTable
+    if not layout or not layout["groupFilter"] then return {} end
+    
+    local shownGroups = {}
+    for group = 1, 8 do
+        if layout["groupFilter"][group] then
+            tinsert(shownGroups, group)
+        end
+    end
+    return shownGroups
+end
+
+-------------------------------------------------------
+-- BUILD GROUP ORDER (your group first, rest unchanged)
+-------------------------------------------------------
+
+local function GetGroupOrder()
+    local shownGroups = GetShownGroups()
+    if not MY_GROUP_FIRST then return shownGroups end
+    
+    local myGroup = GetMyRaidGroup()
+    if not myGroup then return shownGroups end
+    
+    local orderedGroups = {}
+    for _, group in ipairs(shownGroups) do
+        if group == myGroup then
+            tinsert(orderedGroups, group)
+            break
+        end
+    end
+    for _, group in ipairs(shownGroups) do
+        if group ~= myGroup then
+            tinsert(orderedGroups, group)
+        end
+    end
+    return orderedGroups
+end
+
+-------------------------------------------------------
+-- PLAYER-FIRST BUTTON POSITIONING
+--
+-- We only move the 5 physical unit buttons; we never touch
+-- groupFilter/nameList/sortMethod/groupBy/unit attributes -
+-- those stay owned by Cell/Blizzard.
+-------------------------------------------------------
+
+local function SortMyGroupPlayers(header)
+    if not PLAYER_FIRST or not header or InCombatLockdown() then return end
+    
+    local buttons = {}
+    for i = 1, 5 do
+        if header[i] then buttons[i] = header[i] end
+    end
+    
+    -- Find which button currently represents YOU
+    local playerIndex
+    for i = 1, 5 do
+        local button = buttons[i]
+        if button then
+            local unit = button:GetAttribute("unit")
+            if unit and UnitExists(unit) and UnitIsUnit(unit, "player") then
+                playerIndex = i
+                break
+            end
+        end
+    end
+    
+    if not playerIndex or playerIndex == 1 then return end
+    
+    -- Desired visual order: player's button first, rest keep relative order
+    local orderedButtons = { buttons[playerIndex] }
+    for i = 1, 5 do
+        if i ~= playerIndex and buttons[i] then
+            tinsert(orderedButtons, buttons[i])
+        end
+    end
+    
+    -- Same spacing attributes Blizzard's secure header uses for layout
+    local point = header:GetAttribute("point") or "TOP"
+    local relativePoint, xMult, yMult
+    
+    if point == "TOP" then relativePoint, xMult, yMult = "BOTTOM", 0, -1
+    elseif point == "BOTTOM" then relativePoint, xMult, yMult = "TOP", 0, 1
+    elseif point == "LEFT" then relativePoint, xMult, yMult = "RIGHT", 1, 0
+    elseif point == "RIGHT" then relativePoint, xMult, yMult = "LEFT", -1, 0
+    elseif point == "TOPLEFT" then relativePoint, xMult, yMult = "BOTTOMRIGHT", 1, -1
+    elseif point == "TOPRIGHT" then relativePoint, xMult, yMult = "BOTTOMLEFT", -1, -1
+    elseif point == "BOTTOMLEFT" then relativePoint, xMult, yMult = "TOPRIGHT", 1, 1
+    elseif point == "BOTTOMRIGHT" then relativePoint, xMult, yMult = "TOPLEFT", -1, 1
+    else relativePoint, xMult, yMult = "CENTER", 0, 0
+    end
+    
+    local xOffset = header:GetAttribute("xOffset") or 0
+    local yOffset = header:GetAttribute("yOffset") or 0
+    
+    local firstButton = orderedButtons[1]
+    if not firstButton then return end
+    
+    firstButton:ClearAllPoints()
+    firstButton:SetPoint(point, header, point, 0, 0)
+    
+    for i = 2, 5 do
+        local button = orderedButtons[i]
+        if button then
+            button:ClearAllPoints()
+            button:SetPoint(point, orderedButtons[i - 1], relativePoint,
+                math.abs(xOffset) * xMult, math.abs(yOffset) * yMult)
+        end
+    end
+end
+
+-------------------------------------------------------
+-- REPOSITION RAID GROUP HEADERS
+-------------------------------------------------------
+
+local function RepositionRaidGroups()
+    if not IsInRaid() or InCombatLockdown() then return end
+    
+    local layout = Cell.vars.currentLayoutTable
+    if not layout then return end
+    
+    if REQUIRE_COMBINE_GROUPS_OFF and layout["main"]["combineGroups"] then
+        return
+    end
+    
+    local point, anchorPoint, groupAnchorPoint, unitSpacing, groupSpacing,
+    unitSpacingX, unitSpacingY, verticalSpacing, horizontalSpacing,
+    headerPoint, headerColumnAnchorPoint = F.GetRaidFramePoints(layout["main"])
+    
+    local orientation = layout["main"]["orientation"]
+    local maxColumns = layout["main"]["maxColumns"]
+    local orderedGroups = GetGroupOrder()
+    
+    if #orderedGroups == 0 then return end
+    
+    for position, group in ipairs(orderedGroups) do
+        local header = _G["CellRaidFrameHeader" .. group]
+        if header then
+            header:ClearAllPoints()
+            
+            if orientation == "vertical" then
+                header:SetAttribute("columnAnchorPoint", headerColumnAnchorPoint)
+                header:SetAttribute("point", headerPoint)
+                header:SetAttribute("xOffset", 0)
+                header:SetAttribute("yOffset", unitSpacing)
+                header:SetAttribute("unitsPerColumn", 5)
+                
+                if position == 1 then
+                    header:SetPoint(point)
+                else
+                    local headerColumn = ((position - 1) % maxColumns) + 1
+                    if headerColumn == 1 then
+                        local previousGroup = orderedGroups[position - maxColumns]
+                        local previousHeader = _G["CellRaidFrameHeader" .. previousGroup]
+                        if previousHeader then
+                            header:SetPoint(point, previousHeader, 0, verticalSpacing)
+                        end
+                    else
+                        local previousGroup = orderedGroups[position - 1]
+                        local previousHeader = _G["CellRaidFrameHeader" .. previousGroup]
+                        if previousHeader then
+                            header:SetPoint(point, previousHeader, groupAnchorPoint, groupSpacing, 0)
+                        end
+                    end
+                end
+            else
+                header:SetAttribute("columnAnchorPoint", headerColumnAnchorPoint)
+                header:SetAttribute("point", headerPoint)
+                header:SetAttribute("xOffset", unitSpacing)
+                header:SetAttribute("yOffset", 0)
+                header:SetAttribute("unitsPerColumn", 5)
+                
+                if position == 1 then
+                    header:SetPoint(point)
+                else
+                    local headerRow = ((position - 1) % maxColumns) + 1
+                    if headerRow == 1 then
+                        local previousGroup = orderedGroups[position - maxColumns]
+                        local previousHeader = _G["CellRaidFrameHeader" .. previousGroup]
+                        if previousHeader then
+                            header:SetPoint(point, previousHeader, point, horizontalSpacing, 0)
+                        end
+                    else
+                        local previousGroup = orderedGroups[position - 1]
+                        local previousHeader = _G["CellRaidFrameHeader" .. previousGroup]
+                        if previousHeader then
+                            header:SetPoint(point, previousHeader, groupAnchorPoint, 0, groupSpacing)
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Player sorting is NOT done here - SecureGroupHeader_Update can
+    -- immediately rebuild child positions after this runs. It's handled
+    -- by the hook below, after Blizzard finishes updating the header.
+end
+
+-------------------------------------------------------
+-- PLAYER-FIRST AFTER SECURE HEADER UPDATE
+-------------------------------------------------------
+
+local function HookSecureGroupHeader()
+    if not SecureGroupHeader_Update or DynamicRaidGroupFirst_SecureHooked then
+        return
+    end
+    DynamicRaidGroupFirst_SecureHooked = true
+    
+    hooksecurefunc("SecureGroupHeader_Update", function(header)
+            if InCombatLockdown() or not PLAYER_FIRST or not IsInRaid() then return end
+            
+            local name = header:GetName()
+            if not name or not name:match("^CellRaidFrameHeader%d+$") then return end
+            
+            local group = tonumber(name:match("(%d+)$"))
+            if not group then return end
+            
+            local myGroup = GetMyRaidGroup()
+            if not myGroup or group ~= myGroup then return end
+            
+            -- Reorder immediately, in the same frame as Blizzard's own update -
+            -- delaying this a frame is what causes the visible "pop back down".
+            SortMyGroupPlayers(header)
+    end)
+end
+
+-------------------------------------------------------
+-- UPDATE
+-------------------------------------------------------
+
+local function DoUpdate()
+    updateQueued = false
+    if queuedTimer then
+        queuedTimer:Cancel()
+        queuedTimer = nil
+    end
+    
+    if not IsInRaid() then return end
+    
+    if InCombatLockdown() then
+        updateQueued = true
+        return
+    end
+    
+    HookSecureGroupHeader()
+    RepositionRaidGroups()
+    
+    -- Safety net: catches cases where the header didn't go through
+    -- SecureGroupHeader_Update on its own (e.g. we just moved it in
+    -- RepositionRaidGroups but nothing else changed). Idempotent -
+    -- SortMyGroupPlayers no-ops if the player is already button 1.
+    if PLAYER_FIRST then
+        local myGroup = GetMyRaidGroup()
+        if myGroup then
+            local header = _G["CellRaidFrameHeader" .. myGroup]
+            if header then
+                SortMyGroupPlayers(header)
+            end
+        end
+    end
+end
+
+-------------------------------------------------------
+-- QUEUE UPDATE
+-------------------------------------------------------
+
+local function QueueUpdate()
+    updateQueued = true
+    if queuedTimer then
+        queuedTimer:Cancel()
+    end
+    queuedTimer = C_Timer.NewTimer(QUEUE_TIMER, DoUpdate)
+end
+
+-------------------------------------------------------
+-- EVENTS
+-- (3.3.5a uses RAID_ROSTER_UPDATE, not GROUP_ROSTER_UPDATE)
+-------------------------------------------------------
+
+local eventFrame = CreateFrame("Frame")
+eventFrame:RegisterEvent("RAID_ROSTER_UPDATE")
+eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")
+
+eventFrame:SetScript("OnEvent", function(self, event)
+        if event == "PLAYER_REGEN_ENABLED" then
+            if updateQueued then QueueUpdate() end
+            return
+        end
+        QueueUpdate()
+end)
+
+-------------------------------------------------------
+-- CELL LAYOUT CALLBACK
+-------------------------------------------------------
+
+Cell.RegisterCallback("UpdateLayout", "DynamicRaidGroupFirst_UpdateLayout", function()
+        HookSecureGroupHeader()
+        QueueUpdate()
+end)
+
+-------------------------------------------------------
+-- SLASH COMMAND
+-------------------------------------------------------
+
+SLASH_DYNAMICRAIDGROUP1 = "/rgfirst"
+SlashCmdList.DYNAMICRAIDGROUP = function()
+    if InCombatLockdown() then
+        print("|cffff5555Cell Raid Sort:|r queued until combat ends.")
+        QueueUpdate()
+        return
+    end
+    
+    HookSecureGroupHeader()
+    DoUpdate()
+    
+    local group = GetMyRaidGroup()
+    if group then
+        print("|cff55ff55Cell Raid Sort:|r Group " .. group .. " moved first; player position queued.")
+    else
+        print("|cffff5555Cell Raid Sort:|r Could not find your raid group.")
+    end
+end
+
+-------------------------------------------------------
+-- INITIALIZATION
+-------------------------------------------------------
+
+C_Timer.After(1, function()
+        HookSecureGroupHeader()
+        if IsInRaid() then QueueUpdate() end
+end)
+
+
